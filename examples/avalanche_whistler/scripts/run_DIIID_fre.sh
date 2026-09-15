@@ -4,8 +4,8 @@
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
 #SBATCH --time=24:00:00
 set -e
 
@@ -18,7 +18,7 @@ cd /data/zhzhou/DREAM/examples/avalanche_whistler/scripts
 
 
 # ── Select output file to analyze ────────────────────────────────────────
-PLOT_DIR="../figures_w_0.4_1.67_E0.05_t2.5_no_avalanche_s1_i0.2"
+PLOT_DIR="../figures_w_0.1_1.67_E0.05_t2.5_noavalanche_s1_i0.2"
 DATA_DIR="${PLOT_DIR}/quasilinear_whistler_output.h5"
 # Create plot directory if it doesn't exist
 if [ ! -d "$PLOT_DIR" ]; then
@@ -27,10 +27,12 @@ if [ ! -d "$PLOT_DIR" ]; then
 fi
 # Quasilinear whistler simulation
 python generate_with_fre_whistler.py \
-    --amplitude 6e2 --a 0.4 --R 1.67 \
+    --amplitude 1e6 --a 0.1 --R 1.67 \
     --tMax 2.5 --Nt 5000 --source off \
     --output $DATA_DIR \
-    --start-inject-time 1 --inject-cycle-duration 0.2 --ramp-time 0.02 
+    --start-inject-time 1 --inject-cycle-duration 0.2 --ramp-time 0.02 \
+    --k-min 51.61 --k-max 59.55 \
+    --ktheta-min 2.38 --ktheta-max 2.47 --Nxi 80
 
 
 

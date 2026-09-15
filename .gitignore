@@ -49,3 +49,9 @@ DREAMdoc*/
 reasonix.toml
 logs/
 *.png
+!media/*.png
+!doc/**/*.png
+
+examples/*/outputs/
+
+.mimocode

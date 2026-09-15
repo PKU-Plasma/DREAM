@@ -47,8 +47,8 @@ parser.add_argument('--Np-hot', type=int, default=100, dest='Np_hot',
                     help='Hot-tail momentum grid points, default: 100')
 parser.add_argument('--Np-re', type=int, default=200, dest='Np_re',
                     help='Runaway momentum grid points, default: 200')
-parser.add_argument('--Nxi', type=int, default=40,
-                    help='Pitch grid points, default: 40')
+parser.add_argument('--Nxi', type=int, default=80,
+                    help='Pitch grid points, default: 80')
 parser.add_argument('--tMax', type=float, default=2.5,
                     help='Simulation time in seconds, default: 2.5')
 parser.add_argument('--Nt', type=int, default=2500,
@@ -63,6 +63,18 @@ parser.add_argument('--ramp-time', type=float, default=0.02, dest='ramp_time',
                     help='Ramp-up time for injection to avoid step-function shock, default: 0.02')
 parser.add_argument('--source', type=str, default='off', choices=['on', 'off'],
                     help='Enable (kinetic) or disable avalanche source, default: off')
+parser.add_argument('--num-k', type=int, default=16, dest='num_k',
+                    help='Number of wavenumber grid points, default: 16')
+parser.add_argument('--num-ktheta', type=int, default=20, dest='num_ktheta',
+                    help='Number of angle grid points, default: 20')
+parser.add_argument('--k-min', type=float, default=51.61, dest='k_min',
+                    help='Minimum wavenumber in m^-1, default: 51.61')
+parser.add_argument('--k-max', type=float, default=59.55, dest='k_max',
+                    help='Maximum wavenumber in m^-1, default: 59.55')
+parser.add_argument('--ktheta-min', type=float, default=2.38, dest='ktheta_min',
+                    help='Minimum propagation angle in rad, default: 2.38')
+parser.add_argument('--ktheta-max', type=float, default=2.47, dest='ktheta_max',
+                    help='Maximum propagation angle in rad, default: 2.47')
 args = parser.parse_args()
 
 ds = DREAMSettings()
@@ -168,12 +180,12 @@ print(f"  k_parallel: -41 m^-1")
 quadre_wave_params = {
     'k_main': 54.58,              # Total wavenumber (m^-1)
     'ktheta_main': 2.42,          # Propagation angle (rad) - obtuse angle for backward propagation
-    'k_range': [51.61, 59.55],    # Wavenumber range (m^-1)
-    'ktheta_range': [2.38, 2.47]  # Angle range (rad) - centered around 2.42 rad
+    'k_range': [args.k_min, args.k_max],        # Wavenumber range (m^-1)
+    'ktheta_range': [args.ktheta_min, args.ktheta_max]  # Angle range (rad)
 }
 
-print(f"  k range: [{quadre_wave_params['k_range'][0]:.2f}, {quadre_wave_params['k_range'][1]:.2f}] m^-1")
-print(f"  θ_k range: [{quadre_wave_params['ktheta_range'][0]:.2f}, {quadre_wave_params['ktheta_range'][1]:.2f}] rad")
+print(f"  k range: [{args.k_min:.2f}, {args.k_max:.2f}] m^-1")
+print(f"  θ_k range: [{args.ktheta_min:.2f}, {args.ktheta_max:.2f}] rad")
 
 # Enable quasilinear diffusion on f_re (runaway electrons)
 # This is the correct target because:
@@ -182,12 +194,13 @@ print(f"  θ_k range: [{quadre_wave_params['ktheta_range'][0]:.2f}, {quadre_wave
 # - Goal is to suppress runaway growth via wave-particle interactions
 ds.eqsys.f_re.setQuasilinearDiffusion(
     enabled=True,
+    density=args.n,
     quadre_params=quadre_wave_params,
-    num_k=16,              # Match QUADRE discretization
-    num_ktheta=20,        # Match QUADRE discretization
+    num_k=args.num_k,              # Match QUADRE discretization
+    num_ktheta=args.num_ktheta,    # Match QUADRE discretization
     amplitude=args.amplitude,      # Wave amplitude (normalized units) - PHYSICAL VALUE from QUADRE (δB/B₀ ~ 10⁻⁵)
     harmonic_mode='both',  # Include n = -2,-1,0,+1,+2
-    use_simple_dispersion=True,  # Use simplified dispersion for testing (ω = k|k_∥| * w)
+    use_simple_dispersion=False,  # Use simplified dispersion for testing (ω = k|k_∥| * w)
     start_inject_time=args.start_inject_time,
     inject_cycle_duration=args.inject_cycle_duration,
     ramp_time=args.ramp_time
@@ -195,7 +208,7 @@ ds.eqsys.f_re.setQuasilinearDiffusion(
 
 print(f"  ✓ Quasilinear diffusion enabled")
 print(f"  - Spectrum: uniform grid")
-print(f"  - Modes: {8} × {20} = {8*20}")
+print(f"  - Modes: {args.num_k} × {args.num_ktheta} = {args.num_k*args.num_ktheta}")
 print(f"  - Harmonics: n ∈ {{-2, -1, 0, +1, +2}}")
 
 # ============================================================================
@@ -262,5 +275,6 @@ print("\nRunning simulation...")
 do = runiface(ds, args.output, quiet=False)
 
 print("\n" + "="*70)
-print("Quasilinear diffusion simulation completed!")
+print("Simulation completed!")
 print("="*70)
+    

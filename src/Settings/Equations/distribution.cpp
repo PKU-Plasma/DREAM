@@ -63,8 +63,7 @@ void SimulationGenerator::DefineOptions_f_general(Settings *s, const string& mod
 
     // Quasilinear diffusion from external waves
     s->DefineSetting(mod + "/quasilinearmode", "Enables/disables quasilinear diffusion from external waves", (int_t)OptionConstants::QL_DIFFUSION_MODE_NEGLECT);
-    s->DefineSetting(mod + "/quasilinear/use_precomputed_matrix", "Use pre-computed matrix from HDF5 file (0=no, 1=yes)", (int_t)0);
-    s->DefineSetting(mod + "/quasilinear/precomputed_file", "Path to pre-computed HDF5 matrix file", std::string(""));
+    s->DefineSetting(mod + "/quasilinear/density", "Electron density [m^-3]", (real_t)5e18);
     s->DefineSetting(mod + "/quasilinear/amplitude", "Wave amplitude (normalized to n_e m_e c^2)", (real_t)1e-10);
     // Periodic wave injection parameters (QUADRE-style)
     s->DefineSetting(mod + "/quasilinear/start_inject_time", "Time to start wave injection (seconds, -1 means immediate)", (real_t)-1.0);

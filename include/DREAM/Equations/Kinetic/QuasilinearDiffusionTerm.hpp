@@ -9,15 +9,6 @@
 #include "FVM/Equation/DiffusionTerm.hpp"
 #include <vector>
 
-// Forward declaration for pre-computed matrix loader
-namespace DREAM {
-namespace Equations {
-namespace Kinetic {
-class QLMatrixLoader;
-}
-}
-}
-
 namespace DREAM {
     /**
      * Quasi-linear diffusion term from wave-particle interactions.
@@ -43,25 +34,19 @@ namespace DREAM {
         
         std::vector<int> harmonicModes;  // List of n values
         
-        // Pre-computed matrix loader (alternative to on-the-fly computation)
-        Equations::Kinetic::QLMatrixLoader *matrix_loader;
-        bool use_precomputed_matrix;
-        
         // Cached dispersion relation results (omega for each mode)
         real_t *omega_cache;  // [numModes]
         bool dispersion_cached;
         
         // Cached diffusion coefficients (for performance)
-        real_t *D_pp_cache;   // [nr][np1+1][np2]
-        real_t *D_pxi_cache;  // [nr][np1][np2+1]
-        real_t *D_xixi_cache; // [nr][np1][np2+1]
+        real_t *D_pp_cache;        // [nr][np1+1][np2]  — p-face (D11)
+        real_t *D_pxi_pface_cache; // [nr][np1+1][np2]  — p-face (D12)
+        real_t *D_pxi_xface_cache; // [nr][np1][np2+1]  — ξ-face (D21)
+        real_t *D_xixi_cache;      // [nr][np1][np2+1]  — ξ-face (D22)
         
         len_t nr_cached, np1_cached, np2_cached;
         bool first_rebuild_done;  // Flag: true after first Rebuild() call
         bool operator_cached;     // Flag: true if diffusion operator matrices are cached
-        
-        // Time-dependent amplitude (for pre-computed matrix scaling)
-        real_t current_amplitude;
         
         // Track wave amplitudes to detect changes
         real_t *last_amplitudes;  // [numModes] - stores amplitudes from last calculation
@@ -89,23 +74,6 @@ namespace DREAM {
             real_t ramp_time = 0.0
         );
         
-        /**
-         * Constructor (using pre-computed matrix from HDF5)
-         * @param grid              Momentum grid
-         * @param hdf5_file         Path to pre-computed HDF5 file
-         * @param initial_amplitude Initial wave amplitude (can be updated at runtime)
-         * @param start_inject_time Time to start injection (-1 = immediate)
-         * @param inject_cycle_duration Cycle duration (0 = continuous)
-         */
-        QuasilinearDiffusionTerm(
-            FVM::Grid *grid,
-            const std::string &hdf5_file,
-            real_t initial_amplitude = 1.0,
-            real_t start_inject_time = -1.0,
-            real_t inject_cycle_duration = 0.0,
-            real_t ramp_time = 0.0
-        );
-        
         ~QuasilinearDiffusionTerm();
         
         /**
@@ -113,18 +81,7 @@ namespace DREAM {
          */
         void Rebuild(const real_t t, const real_t dt, FVM::UnknownQuantityHandler *uqh) override;
         
-        /**
-         * Set current wave amplitude (for pre-computed matrix mode)
-         * @param A_t  Current amplitude at time t
-         */
-        void setCurrentAmplitude(real_t A_t);
-        
-        /**
-         * Get current wave amplitude
-         * @return Current amplitude A(t)
-         */
-        real_t getCurrentAmplitude() const { return current_amplitude; }
-        
+
     private:
         /**
          * Pre-calculate and cache dispersion relation for all modes

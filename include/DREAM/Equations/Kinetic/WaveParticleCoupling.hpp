@@ -26,13 +26,17 @@ namespace DREAM {
     private:
         real_t omega_pe;   // Electron plasma frequency (rad/s)
         real_t omega_ce;   // Electron cyclotron frequency (rad/s)
+        real_t omega_pi;   // Ion plasma frequency (rad/s)
+        real_t omega_ci;   // Ion cyclotron frequency (rad/s)
         real_t n_e;        // Electron density (m^-3)
         
         // Physical constants
         static constexpr real_t c = 2.99792458e8;      // Speed of light (m/s)
         static constexpr real_t e_charge = 1.60217662e-19;  // Elementary charge (C)
         static constexpr real_t m_electron = 9.1094e-31;    // Electron mass (kg)
+        static constexpr real_t m_ion = 3.3436e-27;         // Deuteron mass (kg)
         static constexpr real_t epsilon_0 = 8.854187817e-12; // Vacuum permittivity
+        static constexpr real_t delta_omega = 1e-4;         // Small shift for numerical d/dω
         
     public:
         /**
@@ -64,6 +68,37 @@ namespace DREAM {
         real_t calculateCouplingStrength(
             real_t p, real_t xi, real_t k, real_t theta_k, int n,
             const WhistlerDispersion &dispersion
+        ) const;
+        
+        /**
+         * Calculate bracket term AND dielectric derivative den simultaneously.
+         *   bracket = e²/(4π m_e² c²) · |ψ_norm|² / |v_g - v∥ cos θ_k|
+         *   den = ∂D/∂ω · ω  (from cold plasma dielectric tensor)
+         *
+         * @param bracket   [out] The normalized bracket term
+         * @param den       [out] Dielectric derivative ∂D/∂ω · ω
+         */
+        void calculateBracketAndDen(
+            real_t p, real_t xi, real_t k, real_t theta_k, int n,
+            const WhistlerDispersion &dispersion,
+            real_t &bracket, real_t &den
+        ) const;
+        
+        /**
+         * Calculate wave polarization (Ex, Ey, Ez) and dielectric derivative (den).
+         * Based on cold plasma dielectric tensor for whistler wave.
+         *
+         * @param omega     Wave angular frequency (rad/s)
+         * @param k         Wavenumber (m^-1)
+         * @param theta_k   Wave propagation angle (rad)
+         * @param Ex        [out] x-component of wave electric field (normalized)
+         * @param Ey        [out] y-component of wave electric field
+         * @param Ez        [out] z-component of wave electric field
+         * @param den       [out] ∂D/∂ω · ω, where D is the dielectric dispersion function
+         */
+        void calculate_den(
+            real_t omega, real_t k, real_t theta_k,
+            real_t &Ex, real_t &Ey, real_t &Ez, real_t &den
         ) const;
         
     private:

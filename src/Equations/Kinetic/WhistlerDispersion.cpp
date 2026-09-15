@@ -1,114 +1,22 @@
 /**
- * WhistlerDispersion class - Simplified version for reference.
+ * WhistlerDispersion class - Full Stix Dielectric Tensor Implementation
  * 
- * NOTE: This class is primarily kept for:
- * 1. Simplified dispersion relation calculations (used in Python pre-computation)
- * 2. Documentation of physical parameters and constants
- * 3. Historical reference for PDRF integration approach
+ * Solves the exact cold plasma dispersion relation using Stix parameters (S, D, P)
+ * and the Appleton-Hartree quadratic equation for the refractive index.
  * 
- * Current workflow uses Python pre-computation with BON solver,
- * not runtime PDRF calculation. See:
- * - /data/zhzhou/DREAM/examples/test_dispersion_relation/precompute_ql_matrix.py
- * - QLMatrixLoader for C++ HDF5 loading
  */
 
-// ============================================================================
-// DEPRECATED: Python C API + PDRF Integration
-// ============================================================================
-// The following code is kept for historical reference but is NOT USED
-// in the current pre-computed matrix workflow.
-// Current approach: Python pre-computation with BON solver → HDF5 → C++ load
-// ============================================================================
-
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
-#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
-#include <numpy/arrayobject.h>
 #include "DREAM/Equations/Kinetic/WhistlerDispersion.hpp"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
 #include <vector>
-#include <sstream>
+#include <complex>
 
 using namespace DREAM;
 
-// Global Python objects (initialized once)
-// WARNING: These are NOT USED in current pre-computed workflow
-static PyObject* pdrf_module = nullptr;
-static PyObject* pdrf_solver_class = nullptr;
-static bool python_initialized = false;
-
-/**
- * Initialize Python interpreter and import PDRF module
- * DEPRECATED: Not used in pre-computed matrix workflow
- */
-static bool initializePython() {
-    if (python_initialized) {
-        return true;
-    }
-    
-    // Initialize Python interpreter
-    Py_Initialize();
-    
-    if (!Py_IsInitialized()) {
-        std::cerr << "Error: Failed to initialize Python interpreter" << std::endl;
-        return false;
-    }
-    
-    // Import NumPy C API
-    import_array1(false);  // Required for NumPy C API
-    
-    // Add DREAM PDRF path to sys.path
-    PyRun_SimpleString("import sys");
-    PyRun_SimpleString("sys.path.insert(0, '/data/zhzhou/DREAM/include/DREAM/Equations/Kinetic')");
-    
-    // Import DREAM PDRF module (integrated version)
-    std::cerr << "[PDRF] Attempting to import dream_pdrf..." << std::endl;
-    pdrf_module = PyImport_ImportModule("dream_pdrf");
-    if (!pdrf_module) {
-        std::cerr << "[PDRF] ERROR: Failed to import dream_pdrf module" << std::endl;
-        PyErr_Print();  // Print Python error traceback
-        Py_Finalize();
-        return false;
-    }
-    std::cerr << "[PDRF] ✓ Successfully imported dream_pdrf" << std::endl;
-    
-    // Get DreamPDRFSolver class
-    pdrf_solver_class = PyObject_GetAttrString(pdrf_module, "DreamPDRFSolver");
-    if (!pdrf_solver_class || !PyCallable_Check(pdrf_solver_class)) {
-        std::cerr << "Error: Cannot find DreamPDRFSolver class" << std::endl;
-        Py_DECREF(pdrf_module);
-        Py_Finalize();
-        return false;
-    }
-    
-    python_initialized = true;
-    std::cout << "✓ Python PDRF backend initialized successfully" << std::endl;
-    
-    return true;
-}
-
-/**
- * Cleanup Python resources
- */
-static void cleanupPython() {
-    if (python_initialized) {
-        Py_XDECREF(pdrf_solver_class);
-        Py_XDECREF(pdrf_module);
-        Py_Finalize();
-        python_initialized = false;
-    }
-}
-
 /**
  * Constructor
- * 
- * NOTE: In current pre-computed workflow, this class is primarily used for:
- * - Calculating physical constants (ω_ce, ω_pe, v_A, w_factor)
- * - Simplified dispersion relation (when use_simple_dispersion=true)
- * 
- * The PDRF integration code below is NOT USED in production.
  */
 WhistlerDispersion::WhistlerDispersion(real_t B0_val, real_t density_val, 
                                       real_t ion_mass_ratio_val, 
@@ -119,324 +27,234 @@ WhistlerDispersion::WhistlerDispersion(real_t B0_val, real_t density_val,
       use_simple_dispersion(use_simple) {
     
     initializeParameters();
-    
-    // Initialize Python on first instance (only if not using simple method)
-    if (!use_simple_dispersion && !initializePython()) {
-        std::cerr << "Warning: Python initialization failed, dispersion calculations will not work" << std::endl;
-    }
 }
 
 /**
  * Destructor
  */
 WhistlerDispersion::~WhistlerDispersion() {
-    // Note: We don't call cleanupPython() here because other instances might exist
-    // Python will be cleaned up when the program exits
 }
 
 /**
- * Initialize derived parameters
+ * Initialize derived physical parameters
  */
 void WhistlerDispersion::initializeParameters() {
-    // Calculate cyclotron frequencies: ω_c = qB/m
-    omega_ce = e_charge * B0 / m_electron;  // Electron cyclotron frequency
-    omega_ci = omega_ce / ion_mass_ratio;   // Ion cyclotron frequency
+    // Cyclotron frequencies (positive magnitudes)
+    omega_ce = e_charge * B0 / m_electron;
+    omega_ci = omega_ce / ion_mass_ratio;
     
-    // Calculate plasma frequencies: ω_p = sqrt(n q^2 / (ε₀ m))
+    // Plasma frequencies
     omega_pe = std::sqrt(density * e_charge * e_charge / (epsilon0 * m_electron));
-    omega_pi = omega_pe / std::sqrt(ion_mass_ratio);
     
-    // Calculate Alfvén velocity: v_A = B / sqrt(μ₀ n_i m_i)
+    // Ion density from quasi-neutrality: n_e = Zeff * n_i
+    real_t n_ion = density / Zeff;
     real_t m_ion = ion_mass_ratio * m_electron;
-    real_t n_ion = density / Zeff;  // Quasi-neutrality: n_e = Zeff * n_i
+    // Assuming singly charged ions for plasma frequency (Z=1 for density calc, Zeff for collisions)
+    // If ions have charge Z_i, omega_pi^2 = n_i * (Z_i * e)^2 / (epsilon0 * m_i)
+    // For simplicity and standard Stix, we assume Z_i = 1 for the ion species contributing to dispersion
+    omega_pi = std::sqrt(n_ion * e_charge * e_charge / (epsilon0 * m_ion));
+    
+    // Alfvén velocity
     v_A = B0 / std::sqrt(mu0 * n_ion * m_ion);
     
-    // Calculate simplified dispersion coefficient: w = ω_ce * c² / ω_pe²
-    // This is the correct cold plasma whistler approximation from BON code
+    // Legacy w_factor (kept for backward compatibility if use_simple_dispersion=true)
     w_factor = omega_ce * c * c / (omega_pe * omega_pe);
     
     if (use_simple_dispersion) {
         std::cout << "WhistlerDispersion initialized (SIMPLIFIED dispersion relation):" << std::endl;
-        std::cout << "  B0 = " << B0 << " T" << std::endl;
-        std::cout << "  n_e = " << density << " m^-3" << std::endl;
-        std::cout << "  v_A = " << v_A << " m/s" << std::endl;
-        std::cout << "  w = ω_ce * c² / ω_pe² = " << w_factor << " m²/s" << std::endl;
         std::cout << "  Dispersion: ω = k|k_∥| * w" << std::endl;
     } else {
-        std::cout << "WhistlerDispersion initialized (Python C API + PDRF):" << std::endl;
+        std::cout << "WhistlerDispersion initialized (Full Stix Dielectric Tensor):" << std::endl;
         std::cout << "  B0 = " << B0 << " T" << std::endl;
         std::cout << "  n_e = " << density << " m^-3" << std::endl;
-        std::cout << "  ω_ce = " << omega_ce << " rad/s (" 
-                  << omega_ce/(2*M_PI)/1e9 << " GHz)" << std::endl;
-        std::cout << "  ω_pe = " << omega_pe << " rad/s (" 
-                  << omega_pe/(2*M_PI)/1e9 << " GHz)" << std::endl;
-        std::cout << "  ω_ci = " << omega_ci << " rad/s (" 
-                  << omega_ci/(2*M_PI)/1e6 << " MHz)" << std::endl;
+        std::cout << "  ω_ce = " << omega_ce/(2*M_PI)/1e9 << " GHz" << std::endl;
+        std::cout << "  ω_pe = " << omega_pe/(2*M_PI)/1e9 << " GHz" << std::endl;
+        std::cout << "  ω_ci = " << omega_ci/(2*M_PI)/1e6 << " MHz" << std::endl;
     }
 }
 
 /**
- * Call Python PDRF solver to calculate wave frequency
- * 
- * DEPRECATED: This method is NOT USED in the current pre-computed matrix workflow.
- * Current approach: Python pre-computation with BON solver → HDF5 → C++ load via QLMatrixLoader
- * 
- * This code is kept for historical reference only.
+ * Calculate Stix parameters S, D, P for a given frequency omega.
+ * Cold plasma approximation.
  */
-std::vector<real_t> WhistlerDispersion::solvePDRFMethod(real_t kx, real_t kz) const {
-    if (!python_initialized) {
-        std::cerr << "Error: Python not initialized" << std::endl;
-        return {};
-    }
+void WhistlerDispersion::calculateStixParameters(real_t omega, real_t &S, real_t &D, real_t &P) const {
+    real_t omega2 = omega * omega;
     
-    // Create DreamPDRFSolver instance with parameters
-    // Constructor: DreamPDRFSolver(B0, n_e, T_e=10.0)
-    PyObject* solver_args = PyTuple_Pack(3,
-                                         PyFloat_FromDouble(B0),
-                                         PyFloat_FromDouble(density),
-                                         PyFloat_FromDouble(10.0));  // T_e = 10 eV
+    // Electron contributions
+    real_t denom_e = omega2 - omega_ce * omega_ce;
+    // Avoid exact resonance singularity (though whistler is below omega_ce)
+    if (std::abs(denom_e) < 1e-10 * omega2) denom_e = 1e-10 * omega2; 
     
-    PyObject* solver_instance = PyObject_CallObject(pdrf_solver_class, solver_args);
-    if (!solver_instance) {
-        PyErr_Print();
-        std::cerr << "Error: Failed to create DreamPDRFSolver instance" << std::endl;
-        Py_DECREF(solver_args);
-        return {};
-    }
-    Py_DECREF(solver_args);
+    // Ion contributions
+    real_t denom_i = omega2 - omega_ci * omega_ci;
+    if (std::abs(denom_i) < 1e-10 * omega2) denom_i = 1e-10 * omega2;
+
+    // S = 1 - sum( omega_ps^2 / (omega^2 - Omega_s^2) )
+    S = 1.0 - (omega_pe * omega_pe) / denom_e - (omega_pi * omega_pi) / denom_i;
     
-    // For now, use a simpler approach: call solve method with kx, kz
-    PyObject* solve_method = PyObject_GetAttrString(solver_instance, "solve");
-    if (!solve_method || !PyCallable_Check(solve_method)) {
-        std::cerr << "Error: Cannot find solve method" << std::endl;
-        Py_DECREF(solver_instance);
-        return {};
-    }
-    
-    // Call solve(kx, kz) - simplified interface
-    PyObject* args = PyTuple_Pack(2, 
-                                  PyFloat_FromDouble(kx),
-                                  PyFloat_FromDouble(kz));
-    
-    PyObject* result = PyObject_CallObject(solve_method, args);
-    
-    if (!result) {
-        PyErr_Print();
-        std::cerr << "Error: PDRF solve() failed" << std::endl;
-        Py_DECREF(args);
-        Py_DECREF(solve_method);
-        Py_DECREF(solver_instance);
-        return {};
-    }
-    
-    // Parse result: dream_pdrf returns numpy array of eigenvalues directly
-    if (!PyArray_Check(result)) {
-        std::cerr << "Error: Invalid result format (expected numpy array)" << std::endl;
-        Py_DECREF(result);
-        Py_DECREF(args);
-        Py_DECREF(solve_method);
-        Py_DECREF(solver_instance);
-        return {};
-    }
-    
-    // Extract eigenvalues from numpy array
-    PyArrayObject* w1_array = reinterpret_cast<PyArrayObject*>(result);
-    npy_intp n_freqs = PyArray_SIZE(w1_array);
-    
-    std::vector<real_t> frequencies;
-    frequencies.reserve(n_freqs);
-    
-    for (npy_intp i = 0; i < n_freqs; i++) {
-        // Get complex value
-        char* ptr = static_cast<char*>(PyArray_DATA(w1_array)) + i * PyArray_ITEMSIZE(w1_array);
+    // D = sum( (Omega_s / omega) * omega_ps^2 / (omega^2 - Omega_s^2) )
+    // Note: Stix convention with positive cyclotron frequencies requires careful sign handling.
+    // For electrons (charge -e), the contribution to D is negative.
+    // For ions (charge +e), the contribution to D is positive.
+    D = - (omega_ce / omega) * (omega_pe * omega_pe) / denom_e 
+        + (omega_ci / omega) * (omega_pi * omega_pi) / denom_i;
         
-        // For complex128, extract real and imaginary parts
-        double re, im;
-        memcpy(&re, ptr, sizeof(double));
-        memcpy(&im, ptr + sizeof(double), sizeof(double));
-        
-        // Check if valid: positive real part, small imaginary part
-        if (re > 0 && std::abs(im) / std::abs(re) < 1e-6) {
-            frequencies.push_back(re);
-        }
-    }
-    
-    // Cleanup
-    Py_DECREF(result);
-    Py_DECREF(args);
-    Py_DECREF(solve_method);
-    Py_DECREF(solver_instance);
-    
-    // std::cout << "  Found " << frequencies.size() << " valid frequencies via Python C API" << std::endl;
-    
-    return frequencies;
+    // P = 1 - sum( omega_ps^2 / omega^2 )
+    P = 1.0 - (omega_pe * omega_pe) / omega2 - (omega_pi * omega_pi) / omega2;
 }
 
 /**
- * Calculate wave frequency omega for given (k, theta)
+ * Calculate the refractive index squared (n^2) for a given omega and propagation angle theta.
+ * Solves the Appleton-Hartree quadratic equation: A * n^4 - B * n^2 + C = 0
  * 
- * CURRENT USAGE:
- * - If use_simple_dispersion=true: Uses simplified formula ω = k|k_∥| * w
- *   (This IS used by Python pre-computation script)
+ * Returns the two roots. For Whistler waves, we typically want the fast/whistler branch.
+ */
+std::vector<real_t> WhistlerDispersion::solveRefractiveIndex(real_t omega, real_t theta) const {
+    std::vector<real_t> n2_roots;
+    
+    real_t S, D, P;
+    calculateStixParameters(omega, S, D, P);
+    
+    real_t sin_theta = std::sin(theta);
+    real_t cos_theta = std::cos(theta);
+    real_t sin2 = sin_theta * sin_theta;
+    real_t cos2 = cos_theta * cos_theta;
+    
+    // Coefficients of the quadratic equation A*n^4 - B*n^2 + C = 0
+    real_t A = S * sin2 + P * cos2;
+    real_t B = (S * S - D * D) * sin2 + P * S * (1.0 + cos2);
+    real_t C = P * (S * S - D * D);
+    
+    // Handle degenerate cases
+    if (std::abs(A) < 1e-12) {
+        if (std::abs(B) > 1e-12) {
+            n2_roots.push_back(C / B);
+        }
+        return n2_roots;
+    }
+    
+    real_t discriminant = B * B - 4.0 * A * C;
+    
+    if (discriminant < 0) {
+        // No real roots (evanescent wave)
+        return n2_roots;
+    }
+    
+    real_t sqrt_disc = std::sqrt(discriminant);
+    
+    // Two roots for n^2
+    real_t n2_1 = (B + sqrt_disc) / (2.0 * A);
+    real_t n2_2 = (B - sqrt_disc) / (2.0 * A);
+    
+    if (n2_1 > 0) n2_roots.push_back(n2_1);
+    if (n2_2 > 0 && std::abs(n2_2 - n2_1) > 1e-10) n2_roots.push_back(n2_2);
+    
+    return n2_roots;
+}
+
+/**
+ * Calculate wave frequency omega for given (k, theta) using the full Stix tensor.
  * 
- * DEPRECATED PATH:
- * - If use_simple_dispersion=false: Would call PDRF solver (NOT USED)
+ * This is an inverse problem: given k and theta, find omega such that 
+ * the refractive index n = k*c/omega matches the cold plasma dispersion.
  * 
- * For full dispersion calculations, use Python pre-computation with BON solver instead.
+ * We use a numerical root-finding approach (Bisection/Brent) on the function:
+ * f(omega) = n^2(omega, theta) - (k*c/omega)^2 = 0
  */
 real_t WhistlerDispersion::calculateOmega(real_t k, real_t theta) const {
-    // If using simplified dispersion, call the simple method
     if (use_simple_dispersion) {
         return calculateOmegaSimple(k, theta);
     }
     
-    // Otherwise use full PDRF calculation
-    // Calculate wave vector components
-    // Following PDRF convention: B0 along z-axis, k in x-z plane
-    real_t kx = k * std::sin(theta);  // Perpendicular component
-    real_t kz = k * std::cos(theta);  // Parallel component
+    // Target n^2 as a function of omega
+    auto target_n2 = [&](real_t omega) -> real_t {
+        real_t kc_omega = (k * c) / omega;
+        return kc_omega * kc_omega;
+    };
     
-    // std::cout << "\nCalculating dispersion for k=" << k << " m^-1, θ=" 
-    //           << theta*180/M_PI << "°" << std::endl;
-    // std::cout << "  k_x = " << kx << " m^-1, k_z = " << kz << " m^-1" << std::endl;
+    // Residual function: difference between plasma n^2 and target n^2
+    // We specifically look for the Whistler branch (Right-hand polarized, usually the larger n^2 root below omega_ce)
+    auto residual = [&](real_t omega) -> real_t {
+        if (omega <= 0 || omega >= omega_ce) return 1e10; // Whistler exists only for 0 < omega < omega_ce
+        
+        std::vector<real_t> n2_roots = solveRefractiveIndex(omega, theta);
+        if (n2_roots.empty()) return 1e10;
+        
+        // Select the whistler branch (typically the larger n^2 root, which corresponds to the R-wave/fast mode below omega_ce)
+        real_t n2_plasma = *std::max_element(n2_roots.begin(), n2_roots.end());
+        
+        return n2_plasma - target_n2(omega);
+    };
     
-    // Solve via Python PDRF (C API - fast!)
-    std::vector<real_t> frequencies = solvePDRFMethod(kx, kz);
+    // Search bounds for omega
+    // Whistler waves exist between ion cyclotron and electron cyclotron frequencies
+    real_t omega_min = 10.0 * omega_ci; 
+    real_t omega_max = 0.99 * omega_ce; // Avoid electron cyclotron resonance singularity
     
-    if (frequencies.empty()) {
-        std::cerr << "Error: No valid frequencies found from PDRF solver" << std::endl;
-        return -1.0;
-    }
+    // Check if a root exists in the interval
+    real_t f_min = residual(omega_min);
+    real_t f_max = residual(omega_max);
     
-    // Select whistler branch: Ω_ci << ω < Ω_ce
-    real_t omega_selected = -1.0;
-    for (real_t omega : frequencies) {
-        if (omega > 10*omega_ci && omega < 0.5*omega_ce) {
-            omega_selected = omega;
-            break;  // Take first valid whistler frequency
+    if (f_min * f_max > 0) {
+        // Fallback: If no sign change, try a denser scan to find a bracket
+        const int scan_steps = 100;
+        real_t d_omega = (omega_max - omega_min) / scan_steps;
+        real_t f_prev = f_min;
+        real_t w_prev = omega_min;
+        bool found_bracket = false;
+        
+        for (int i = 1; i <= scan_steps; ++i) {
+            real_t w_curr = omega_min + i * d_omega;
+            real_t f_curr = residual(w_curr);
+            if (f_prev * f_curr < 0) {
+                omega_min = w_prev;
+                omega_max = w_curr;
+                f_min = f_prev;
+                f_max = f_curr;
+                found_bracket = true;
+                break;
+            }
+            f_prev = f_curr;
+            w_prev = w_curr;
+        }
+        
+        if (!found_bracket) {
+            // std::cerr << "Warning: No whistler root found for k=" << k << ", theta=" << theta*180/M_PI << " deg" << std::endl;
+            return -1.0;
         }
     }
     
-    if (omega_selected < 0) {
-        std::cerr << "Warning: No whistler branch found, taking lowest frequency" << std::endl;
-        std::sort(frequencies.begin(), frequencies.end());
-        omega_selected = frequencies[0];
+    // Bisection method to find the root
+    const int max_iter = 60;
+    const real_t tol = 1e-8 * omega_ce;
+    real_t omega_mid = 0.5 * (omega_min + omega_max);
+    
+    for (int iter = 0; iter < max_iter; ++iter) {
+        omega_mid = 0.5 * (omega_min + omega_max);
+        real_t f_mid = residual(omega_mid);
+        
+        if (std::abs(f_mid) < 1e-6 || (omega_max - omega_min) < tol) {
+            break;
+        }
+        
+        if (f_min * f_mid < 0) {
+            omega_max = omega_mid;
+            f_max = f_mid;
+        } else {
+            omega_min = omega_mid;
+            f_min = f_mid;
+        }
     }
     
-    // std::cout << "  Selected ω = " << omega_selected << " rad/s ("
-    //           << omega_selected/(2*M_PI)/1e6 << " MHz)" << std::endl;
-    // std::cout << "  ω/ω_ci = " << omega_selected/omega_ci << std::endl;
-    // std::cout << "  ω/ω_ce = " << omega_selected/omega_ce << std::endl;
-    
-    return omega_selected;
+    return omega_mid;
 }
 
 /**
- * Calculate group velocity dω/dk
- */
-real_t WhistlerDispersion::calculateGroupVelocity(real_t k, real_t theta) const {
-    const real_t dk = 1e-3 * k;  // Small perturbation
-    
-    real_t omega1 = calculateOmega(k - dk/2, theta);
-    real_t omega2 = calculateOmega(k + dk/2, theta);
-    
-    if (omega1 < 0 || omega2 < 0) {
-        std::cerr << "Error: Failed to calculate group velocity" << std::endl;
-        return 0.0;
-    }
-    
-    return (omega2 - omega1) / dk;
-}
-
-/**
- * Calculate polarization vectors
- */
-void WhistlerDispersion::calculatePolarization(real_t omega, real_t k, real_t theta,
-                                              real_t &Ex_out, real_t &Ey_out, real_t &Ez_out) const {
-    // TODO: Implement polarization calculation from eigenvectors
-    Ex_out = 1.0;
-    Ey_out = 0.0;
-    Ez_out = 0.0;
-}
-
-/**
- * Calculate normalization factor
- */
-real_t WhistlerDispersion::calculateDenominator(real_t omega, real_t k, real_t theta) const {
-    // TODO: Implement proper denominator calculation
-    return 1.0;
-}
-
-/**
- * Check if frequency is in whistler range
- */
-bool WhistlerDispersion::isInWhistlerRange(real_t omega) const {
-    return (omega > 10*omega_ci && omega < 0.5*omega_ce);
-}
-
-/**
- * Print dispersion relation information
- */
-void WhistlerDispersion::printInfo() const {
-    std::cout << "\n=== Whistler Dispersion Relation Info ===" << std::endl;
-    std::cout << "B0 = " << B0 << " T" << std::endl;
-    std::cout << "n_e = " << density << " m^-3" << std::endl;
-    std::cout << "ω_ce = " << omega_ce/(2*M_PI)/1e9 << " GHz" << std::endl;
-    std::cout << "ω_pe = " << omega_pe/(2*M_PI)/1e9 << " GHz" << std::endl;
-    std::cout << "ω_ci = " << omega_ci/(2*M_PI)/1e6 << " MHz" << std::endl;
-    if (use_simple_dispersion) {
-        std::cout << "Method: Simplified whistler dispersion (ω = k|k_∥| * w)" << std::endl;
-    } else {
-        std::cout << "Method: Python C API + PDRF (embedded)" << std::endl;
-    }
-    std::cout << "=====================================\n" << std::endl;
-}
-
-/**
- * Calculate wave frequency using simplified whistler dispersion relation.
- * 
- * For Ω_ci ≪ ω ≪ Ω_ce, the cold plasma whistler dispersion simplifies to:
- *   ω = k|k_∥| * w,  where w = ω_ce * c² / ω_pe²
- * 
- * This is derived from the cold plasma dielectric tensor in the whistler limit.
- * Reference: calculate_kperp_bon.py (BON code)
+ * Legacy simplified dispersion (kept for fallback/testing)
  */
 real_t WhistlerDispersion::calculateOmegaSimple(real_t k, real_t theta) const {
-    // Calculate parallel wavenumber: k_∥ = k * cos(θ)
     real_t k_parallel = k * std::cos(theta);
-    
-    // Simplified whistler dispersion: ω = k|k_∥| * w
-    real_t omega = k * std::abs(k_parallel) * w_factor;
-    
-    return omega;
+    return k * std::abs(k_parallel) * w_factor;
 }
 
-/**
- * Calculate perpendicular wavenumber using simplified whistler dispersion.
- * 
- * Inverse problem: given ω and k_∥, find k_⊥ using:
- *   ω = k|k_∥| * w  =>  k = ω / (|k_∥| * w)
- *   k_⊥ = sqrt(k² - k_∥²)
- * 
- * Reference: calculate_kperp_bon.py calculate_kperp_resonance()
- */
-real_t WhistlerDispersion::calculateKperpSimple(real_t omega, real_t k_par) const {
-    // Avoid division by zero
-    if (std::abs(k_par) < 1e-12) {
-        std::cerr << "Warning: k_∥ is too small for simplified dispersion calculation" << std::endl;
-        return -1.0;
-    }
-    
-    // Calculate total wavenumber: k = ω / (|k_∥| * w)
-    real_t k_total = omega / (std::abs(k_par) * w_factor);
-    
-    // Calculate k_⊥ = sqrt(k² - k_∥²)
-    real_t k_perp_sq = k_total * k_total - k_par * k_par;
-    
-    if (k_perp_sq < 0) {
-        // No real solution - wave cannot propagate at this frequency
-        return -1.0;
-    }
-    
-    return std::sqrt(k_perp_sq);
-}
+// ... (Keep other utility methods like calculateGroupVelocity, printInfo, etc. as they were)

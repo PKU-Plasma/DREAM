@@ -101,7 +101,6 @@ std::vector<real_t> ResonanceSolver::findResonantP(
             real_t p_left = p_curr - dp;
             real_t p_right = p_curr;
             real_t f_left = f_prev;
-            real_t f_right = f_curr;
             
             // Bisection method
             const int max_iter = 50;
@@ -119,7 +118,6 @@ std::vector<real_t> ResonanceSolver::findResonantP(
                 // Update bracket
                 if (f_left * f_mid < 0.0) {
                     p_right = p_root;
-                    f_right = f_mid;
                 } else {
                     p_left = p_root;
                     f_left = f_mid;

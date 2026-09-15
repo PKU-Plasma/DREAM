@@ -18,6 +18,12 @@ using namespace DREAM;
 WaveParticleCoupling::WaveParticleCoupling(
     real_t omega_pe_val, real_t omega_ce_val, real_t n_e_val
 ) : omega_pe(omega_pe_val), omega_ce(omega_ce_val), n_e(n_e_val) {
+    // Derive ion frequencies assuming deuterium plasma (Z=1, n_i = n_e)
+    // omega_pi = omega_pe * sqrt(m_e / m_D)
+    // omega_ci = omega_ce * (m_e / m_D)
+    real_t mass_ratio = m_electron / m_ion;  // m_e / m_D
+    omega_pi = omega_pe * std::sqrt(mass_ratio);
+    omega_ci = omega_ce * mass_ratio;
 }
 
 /**
@@ -50,6 +56,69 @@ real_t WaveParticleCoupling::calculateGyroradius(real_t p, real_t xi) const {
 }
 
 /**
+ * Calculate wave polarization (Ex, Ey, Ez) and dielectric derivative (den).
+ * Based on cold plasma dielectric tensor.
+ *
+ * den = [D(ω+δω) - D(ω)] / (δω · ω) where D is the dispersion function.
+ */
+void WaveParticleCoupling::calculate_den(
+    real_t omega, real_t k, real_t theta_k,
+    real_t &Ex, real_t &Ey, real_t &Ez, real_t &den
+) const {
+    real_t cc = c;
+    real_t kpar = k * std::cos(theta_k);
+    real_t kperp = k * std::sin(theta_k);
+    real_t omegace2 = omega_ce * omega_ce;
+    real_t omegaci2 = omega_ci * omega_ci;
+    real_t omegape2 = omega_pe * omega_pe;
+    real_t omegapi2 = omega_pi * omega_pi;
+    real_t omega2 = omega * omega;
+
+    // Ex = 1 (normalized)
+    Ex = 1.0;
+
+    // Ey from cold plasma polarization
+    real_t n2 = k * k * cc * cc / omega2;  // refractive index squared
+
+    Ey = (omega_ce / omega * omegape2 / (omega2 - omegace2)
+        - omega_ci / omega * omegapi2 / (omega2 - omegaci2))
+       / (1.0 - omegape2 / (omega2 - omegace2)
+              - omegapi2 / (omega2 - omegaci2)
+              - n2);
+
+    // Ez from parallel component
+    Ez = -kpar * cc / omega
+       / (1.0 - omegape2 / omega2 - omegapi2 / omega2
+              - kperp * kperp * cc * cc / (omega2))
+       * kperp * cc / omega;
+
+    // Denominator D(ω) and numerical derivative ∂D/∂ω
+    // D(ω) = [(1+Ey²)·S - 2·Ey·T + Ez²·P] · ω²
+    // where S = (R+L)/2, T = (R-L)/2 in Stix notation
+    // Here expanded directly:
+    auto D_func = [&](real_t w) -> real_t {
+        real_t w2 = w * w;
+        real_t Ey_w = (omega_ce / w * omegape2 / (w2 - omegace2)
+                      - omega_ci / w * omegapi2 / (w2 - omegaci2))
+                    / (1.0 - omegape2 / (w2 - omegace2)
+                           - omegapi2 / (w2 - omegaci2)
+                           - k * k * cc * cc / w2);
+        real_t Ez_w = -kpar * cc / w
+                    / (1.0 - omegape2 / w2 - omegapi2 / w2
+                           - kperp * kperp * cc * cc / w2)
+                    * kperp * cc / w;
+
+        return ((1.0 + Ey_w * Ey_w) * (1.0 - omegape2 / (w2 - omegace2) - omegapi2 / (w2 - omegaci2))
+              - 2.0 * Ey_w * (omega_ce / w * omegape2 / (w2 - omegace2) - omega_ci / w * omegapi2 / (w2 - omegaci2))
+              + Ez_w * Ez_w * (1.0 - omegape2 / w2) - omegapi2 / w2) * w2;
+    };
+
+    real_t D_omega = D_func(omega);
+    real_t D_omega_shifted = D_func(omega + delta_omega);
+    den = (D_omega_shifted - D_omega) / (delta_omega * omega);
+}
+
+/**
  * Calculate group velocity ∂ω/∂k using numerical differentiation
  */
 real_t WaveParticleCoupling::calculateGroupVelocity(
@@ -68,82 +137,124 @@ real_t WaveParticleCoupling::calculateGroupVelocity(
 }
 
 /**
- * Calculate coupling strength |Ψ_{n,k}|²
- * 
- * Implements the formula from QUADRE inject.py (lines 689-692):
- *   weight = [coupling_term]² / |dω/dk - α| / den · k²·ω_pe²/(n_e·π)
+ * Calculate the normalized bracket term for quasi-linear diffusion.
+ *
+ *   bracket = e²/(4π m_e² c²) · |ψ_norm|² / |v_g - v∥ cos θ_k|
+ *
+ * where |ψ_norm|² is the normalized coupling matrix element with Ex=1:
+ *   |ψ_norm|² = |Ex·(n/z)·Jn(z) + i·Ey·Jn'(z) + (p∥/p⊥)·Ez·Jn(z)|²
+ *
+ * The actual coupling strength is then: bracket × |E_k|²
+ * where |E_k|² = amplitude × m_e c² / (ε₀ × den)
  */
 real_t WaveParticleCoupling::calculateCouplingStrength(
     real_t p, real_t xi, real_t k, real_t theta_k, int n,
     const WhistlerDispersion &dispersion
 ) const {
-    // Calculate particle parameters
-    real_t gamma = std::sqrt(1.0 + p * p);
-    real_t v_parallel_over_c = (p / gamma) * xi;
-    real_t alpha = v_parallel_over_c * c * std::cos(theta_k);  // v_∥ cos(θ_k)
-    
-    // Calculate wave parameters
     real_t omega = dispersion.calculateOmega(k, theta_k);
+    if (omega < 0) return 0.0;
+
+    // Get wave polarization and dielectric derivative from cold plasma theory
+    real_t Ex, Ey, Ez, den;
+    calculate_den(omega, k, theta_k, Ex, Ey, Ez, den);
+
+    // Particle kinematics
+    real_t gamma = std::sqrt(1.0 + p * p);
+    real_t v_parallel = (p / gamma) * xi * c;      // m/s
+    real_t p_perp = p * std::sqrt(std::max(0.0, 1.0 - xi * xi));
+
+    // Bessel function argument
     real_t k_perp = k * std::sin(theta_k);
-    
-    // Calculate gyroradius and argument for Bessel functions
     real_t rho = calculateGyroradius(p, xi);
-    real_t kperp_rho = k_perp * rho;
-    
-    // Get wave polarization from dispersion solver
-    // For now, use simplified whistler wave polarization
-    // In full implementation, this should come from eigenvector calculation
-    real_t Ex = 1.0;  // Normalized
-    real_t Ey = 0.0;  // Simplified - should be calculated from dispersion
-    real_t Ez = 0.0;  // Simplified - should be calculated from dispersion
-    
-    // TODO: Implement proper polarization calculation
-    // This requires solving for eigenvectors of the dispersion matrix
-    // For whistler waves, typical polarization is:
-    // E_y/E_x ≈ i·ω/Ω_ce (circular polarization)
-    // E_z is small for parallel propagation
-    
-    // Calculate coupling term (from QUADRE line 689)
-    real_t bessel_n = besselJ(n, kperp_rho);
-    real_t bessel_np1 = besselJ(n + 1, kperp_rho);
-    real_t bessel_nm1 = besselJ(n - 1, kperp_rho);
-    
-    real_t coupling_term = 0.0;
-    
-    if (std::abs(kperp_rho) > 1e-10) {
-        coupling_term += static_cast<real_t>(n) * bessel_n / kperp_rho;
+    real_t z = k_perp * rho;                        // k⊥ρ (dimensionless)
+
+    real_t bessel_n   = besselJ(n, z);
+    real_t bessel_np1 = besselJ(n + 1, z);
+    real_t bessel_nm1 = besselJ(n - 1, z);
+
+    // Jn'(z) = [J_{n-1}(z) - J_{n+1}(z)] / 2
+    real_t bessel_n_prime = (bessel_nm1 - bessel_np1) / 2.0;
+
+    // Coupling term: n·Jn(z)/z
+    real_t n_over_z_Jn = 0.0;
+    if (std::abs(z) > 1e-10) {
+        n_over_z_Jn = static_cast<real_t>(n) * bessel_n / z;
     } else {
-        // Limit as kperp_rho → 0
-        coupling_term += (n == 0) ? 0.5 : 0.0;
+        n_over_z_Jn = (n == 0) ? 0.5 : 0.0;
     }
-    
-    // Add E_z term (small for whistler waves)
-    if (std::abs(xi) < 1.0) {  // Avoid division by zero at ξ=±1
-        coupling_term += Ez * bessel_n * xi / std::sqrt(1.0 - xi*xi);
+
+    // Normalized matrix element (Ex = 1):
+    // ψ_norm = Ex·(n/z)·Jn + i·Ey·Jn' + (p∥/p⊥)·Ez·Jn
+    real_t ppar_over_pperp = 0.0;
+    if (p_perp > 1e-30) {
+        ppar_over_pperp = (p * xi) / p_perp;
     }
-    
-    // Add E_y term (important for circular polarization)
-    coupling_term -= Ey * (bessel_np1 - bessel_nm1) / 2.0;
-    
-    // Square the coupling term
-    real_t weight = coupling_term * coupling_term;
-    
-    // Calculate denominator |∂ω/∂k - α|
-    real_t group_velocity = calculateGroupVelocity(k, theta_k, dispersion);
-    real_t denom = std::abs(group_velocity - alpha);
-    
-    if (denom < 1e-10) {
-        // Avoid division by zero
-        denom = 1e-10;
-    }
-    
-    weight /= denom;
-    
-    // Normalize by wave energy density (simplified)
-    // Full implementation needs dielectric tensor derivative "den"
-    // For now, use simplified normalization
-    real_t normalization = k * k * omega_pe * omega_pe / (n_e * M_PI);
-    weight *= normalization;
-    
-    return weight;
+
+    // |ψ_norm|² = [Re]² + [Im]²
+    //   Re = (n/z)·Jn + (p∥/p⊥)·Ez·Jn
+    //   Im = Ey·Jn'
+    real_t psi_real = n_over_z_Jn + ppar_over_pperp * Ez * bessel_n;
+    real_t psi_imag = Ey * bessel_n_prime;
+    real_t psi_norm_sq = psi_real * psi_real + psi_imag * psi_imag;
+
+    // Resonance denominator |∂ω/∂k - v∥ cos θ_k|
+    real_t v_g = calculateGroupVelocity(k, theta_k, dispersion);
+    real_t denom = std::abs(v_g - v_parallel * std::cos(theta_k));
+    if (denom < 1e-10) denom = 1e-10;
+
+    // Prefactor: e²/(4π m_e² c²)
+    static constexpr real_t prefactor = e_charge * e_charge
+                                      / (4.0 * M_PI * m_electron * m_electron * c * c);
+
+    return prefactor * psi_norm_sq / denom;
+}
+
+/**
+ * Calculate both the bracket term and dielectric derivative den.
+ * Avoids computing omega, polarization, and Bessel functions twice.
+ */
+void WaveParticleCoupling::calculateBracketAndDen(
+    real_t p, real_t xi, real_t k, real_t theta_k, int n,
+    const WhistlerDispersion &dispersion,
+    real_t &bracket, real_t &den
+) const {
+    real_t omega = dispersion.calculateOmega(k, theta_k);
+    if (omega < 0) { bracket = 0.0; den = 1.0; return; }
+
+    real_t Ex, Ey, Ez;
+    calculate_den(omega, k, theta_k, Ex, Ey, Ez, den);
+
+    real_t gamma = std::sqrt(1.0 + p * p);
+    real_t v_parallel = (p / gamma) * xi * c;
+    real_t p_perp = p * std::sqrt(std::max(0.0, 1.0 - xi * xi));
+
+    real_t k_perp = k * std::sin(theta_k);
+    real_t rho = calculateGyroradius(p, xi);
+    real_t z = k_perp * rho;
+
+    real_t bessel_n   = besselJ(n, z);
+    real_t bessel_np1 = besselJ(n + 1, z);
+    real_t bessel_nm1 = besselJ(n - 1, z);
+    real_t bessel_n_prime = (bessel_nm1 - bessel_np1) / 2.0;
+
+    real_t n_over_z_Jn = 0.0;
+    if (std::abs(z) > 1e-10)
+        n_over_z_Jn = static_cast<real_t>(n) * bessel_n / z;
+    else
+        n_over_z_Jn = (n == 0) ? 0.5 : 0.0;
+
+    real_t ppar_over_pperp = (p_perp > 1e-30) ? (p * xi) / p_perp : 0.0;
+
+    real_t psi_real = n_over_z_Jn + ppar_over_pperp * Ez * bessel_n;
+    real_t psi_imag = Ey * bessel_n_prime;
+    real_t psi_norm_sq = psi_real * psi_real + psi_imag * psi_imag;
+
+    real_t v_g = calculateGroupVelocity(k, theta_k, dispersion);
+    real_t denom = std::abs(v_g - v_parallel * std::cos(theta_k));
+    if (denom < 1e-10) denom = 1e-10;
+
+    static constexpr real_t prefactor = e_charge * e_charge
+                                      / (4.0 * M_PI * m_electron * m_electron * c * c);
+
+    bracket = prefactor * psi_norm_sq / denom;
 }

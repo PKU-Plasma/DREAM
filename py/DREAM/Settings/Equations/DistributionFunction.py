@@ -440,6 +440,7 @@ class DistributionFunction(UnknownQuantity):
             # Add quasilinear diffusion parameters if enabled
             if self.quasilinearmode == QL_DIFFUSION_MODE_INCLUDE:
                 data['quasilinear'] = {
+                    'density': getattr(self, 'ql_density', 5e18),
                     'use_precomputed_matrix': getattr(self, 'ql_use_precomputed_matrix', 0),
                     'spectrum_type': getattr(self, 'wave_spectrum_type', WAVE_SPECTRUM_UNIFORM),
                     'num_k': getattr(self, 'ql_num_k', 100),
@@ -593,7 +594,8 @@ class DistributionFunction(UnknownQuantity):
                 .format(self.name, self.T0.size, self.rT0.size))
 
 
-    def setQuasilinearDiffusion(self, enabled=True, 
+    def setQuasilinearDiffusion(self, enabled=True,
+                               density=5e18,
                                spectrum_type='uniform',
                                num_k=100, num_ktheta=20,
                                k_min=None, k_max=None,
@@ -615,6 +617,7 @@ class DistributionFunction(UnknownQuantity):
         
         Parameters:
             enabled:         If True, enables quasilinear diffusion
+            density:         Electron density [m^-3] for dispersion relation calculation
             spectrum_type:   Type of wave spectrum ('uniform', 'gaussian', or 'custom')
             num_k:           Number of wavenumber grid points
             num_ktheta:      Number of angle grid points
@@ -661,7 +664,10 @@ class DistributionFunction(UnknownQuantity):
             return
         
         self.quasilinearmode = QL_DIFFUSION_MODE_INCLUDE
-        
+
+        # Store electron density
+        self.ql_density = density
+
         # Set pre-computed matrix mode
         self.ql_use_precomputed_matrix = 1 if use_precomputed_matrix else 0
         self.ql_precomputed_file = precomputed_file

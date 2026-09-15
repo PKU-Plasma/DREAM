@@ -6,12 +6,10 @@
  */
 
 #include "DREAM/Equations/Kinetic/QuasilinearDiffusionTerm.hpp"
-#include "DREAM/Equations/Kinetic/QLMatrixLoader.hpp"
 #include "DREAM/DREAMException.hpp"
 #include "FVM/Grid/MomentumGrid.hpp"
 #include <iostream>
 #include <cmath>
-#include <map>
 
 using namespace DREAM;
 
@@ -34,19 +32,17 @@ QuasilinearDiffusionTerm::QuasilinearDiffusionTerm(
     resonanceSolver(resonanceSolver),
     coupling(coupling),
     harmonicModes(harmonicModes),
-    matrix_loader(nullptr),
-    use_precomputed_matrix(false),
     omega_cache(nullptr),
     dispersion_cached(false),
     D_pp_cache(nullptr),
-    D_pxi_cache(nullptr),
+    D_pxi_pface_cache(nullptr),
+    D_pxi_xface_cache(nullptr),
     D_xixi_cache(nullptr),
     nr_cached(0),
     np1_cached(0),
     np2_cached(0),
     first_rebuild_done(false),
     operator_cached(false),
-    current_amplitude(1.0),
     last_amplitudes(nullptr),
     num_modes_tracked(0),
     start_inject_time(start_inject_time),
@@ -61,91 +57,15 @@ QuasilinearDiffusionTerm::QuasilinearDiffusionTerm(
 }
 
 /**
- * Constructor using pre-computed matrix from HDF5
- */
-QuasilinearDiffusionTerm::QuasilinearDiffusionTerm(
-    FVM::Grid *grid,
-    const std::string &hdf5_file,
-    real_t initial_amplitude,
-    real_t start_inject_time,
-    real_t inject_cycle_duration,
-    real_t ramp_time
-) : FVM::DiffusionTerm(grid),
-    spectrum(nullptr),
-    dispersion(nullptr),
-    resonanceSolver(nullptr),
-    coupling(nullptr),
-    matrix_loader(nullptr),
-    use_precomputed_matrix(true),
-    omega_cache(nullptr),
-    dispersion_cached(false),
-    D_pp_cache(nullptr),
-    D_pxi_cache(nullptr),
-    D_xixi_cache(nullptr),
-    nr_cached(0),
-    np1_cached(0),
-    np2_cached(0),
-    first_rebuild_done(false),
-    operator_cached(false),
-    current_amplitude(initial_amplitude),
-    last_amplitudes(nullptr),
-    num_modes_tracked(0),
-    start_inject_time(start_inject_time),
-    inject_cycle_duration(inject_cycle_duration),
-    ramp_time(ramp_time),
-    base_amplitude(initial_amplitude) {
-    
-    SetName("QuasilinearDiffusionTerm");
-    
-    // Load pre-computed matrix from HDF5
-    matrix_loader = new Equations::Kinetic::QLMatrixLoader(hdf5_file);
-    
-    // Verify grid compatibility
-    auto *mg = grid->GetMomentumGrid(0);
-    if (mg) {
-        len_t np1 = mg->GetNp1();
-        len_t np2 = mg->GetNp2();
-        
-        if (matrix_loader->getNumP() != np1 || matrix_loader->getNumXi() != np2) {
-            std::cerr << "Warning: Momentum grid mismatch!" << std::endl;
-            std::cerr << "  HDF5 file: " << matrix_loader->getNumP() << " x " << matrix_loader->getNumXi() << std::endl;
-            std::cerr << "  DREAM grid: " << np1 << " x " << np2 << std::endl;
-            std::cerr << "  Diffusion coefficients may be incorrect." << std::endl;
-        }
-    }
-    
-    std::cerr << "✓ Quasi-linear diffusion term initialized with pre-computed matrix" << std::endl;
-    std::cerr << "  Initial amplitude: " << initial_amplitude << std::endl;
-    if (start_inject_time >= 0) {
-        std::cerr << "  Periodic injection: start=" << start_inject_time 
-                  << " s, cycle=" << inject_cycle_duration << " s" << std::endl;
-    }
-}
-
-/**
  * Destructor - free cached arrays
  */
 QuasilinearDiffusionTerm::~QuasilinearDiffusionTerm() {
     if (omega_cache) delete[] omega_cache;
     if (D_pp_cache) delete[] D_pp_cache;
-    if (D_pxi_cache) delete[] D_pxi_cache;
+    if (D_pxi_pface_cache) delete[] D_pxi_pface_cache;
+    if (D_pxi_xface_cache) delete[] D_pxi_xface_cache;
     if (D_xixi_cache) delete[] D_xixi_cache;
     if (last_amplitudes) delete[] last_amplitudes;
-    if (matrix_loader) delete matrix_loader;
-}
-
-/**
- * Set current wave amplitude (for pre-computed matrix mode)
- */
-void QuasilinearDiffusionTerm::setCurrentAmplitude(real_t A_t) {
-    current_amplitude = A_t;
-    
-    if (use_precomputed_matrix && matrix_loader) {
-        matrix_loader->setCurrentAmplitude(A_t);
-    }
-    
-    // Mark operator as not cached so it will be rebuilt with new amplitude
-    operator_cached = false;
 }
 
 /**
@@ -197,12 +117,12 @@ real_t QuasilinearDiffusionTerm::getD_pp(len_t ir, len_t i, len_t j) const {
 }
 
 /**
- * Get cached D_pξ coefficient
+ * Get cached D_pξ coefficient (ξ-face layout, for backward compatibility)
  */
 real_t QuasilinearDiffusionTerm::getD_pxi(len_t ir, len_t i, len_t j) const {
-    if (!D_pxi_cache || ir >= nr_cached) return 0.0;
+    if (!D_pxi_xface_cache || ir >= nr_cached) return 0.0;
     len_t idx = ir * np1_cached * (np2_cached + 1) + i * (np2_cached + 1) + j;
-    return D_pxi_cache[idx];
+    return D_pxi_xface_cache[idx];
 }
 
 /**
@@ -260,13 +180,8 @@ void QuasilinearDiffusionTerm::Rebuild(const real_t t, const real_t /*dt*/, FVM:
     // ====================================================================
     real_t effective_amplitude = calculateEffectiveAmplitude(t);
     
-    // For pre-computed matrix mode: update matrix loader
-    if (use_precomputed_matrix && matrix_loader) {
-        matrix_loader->setCurrentAmplitude(effective_amplitude);
-    }
-    
-    // For on-the-fly mode: update spectrum amplitudes
-    if (spectrum && !use_precomputed_matrix) {
+    // Update spectrum amplitudes
+    if (spectrum) {
         len_t numModes = spectrum->getNumModes();
         bool amplitude_changed = false;
         
@@ -287,7 +202,7 @@ void QuasilinearDiffusionTerm::Rebuild(const real_t t, const real_t /*dt*/, FVM:
     
     // Check if wave spectrum amplitude has changed (legacy check for external updates)
     bool amplitude_changed_external = false;
-    if (spectrum && operator_cached && !use_precomputed_matrix) {
+    if (spectrum && operator_cached) {
         len_t numModes = spectrum->getNumK() * spectrum->getNumKtheta();
         for (len_t m = 0; m < numModes; m++) {
             real_t current_amp = spectrum->getAmplitude(m);
@@ -309,137 +224,30 @@ void QuasilinearDiffusionTerm::Rebuild(const real_t t, const real_t /*dt*/, FVM:
     // Allocate or reallocate cache if needed (first time or grid size changed)
     if (!operator_cached || nr != nr_cached) {
         if (D_pp_cache) delete[] D_pp_cache;
-        if (D_pxi_cache) delete[] D_pxi_cache;
+        if (D_pxi_pface_cache) delete[] D_pxi_pface_cache;
+        if (D_pxi_xface_cache) delete[] D_pxi_xface_cache;
         if (D_xixi_cache) delete[] D_xixi_cache;
         
         auto *mg = grid->GetMomentumGrid(0);
         np1_cached = mg->GetNp1();
         np2_cached = mg->GetNp2();
         
-        D_pp_cache = new real_t[nr * (np1_cached + 1) * np2_cached];
-        D_pxi_cache = new real_t[nr * np1_cached * (np2_cached + 1)];
-        D_xixi_cache = new real_t[nr * np1_cached * (np2_cached + 1)];
+        D_pp_cache        = new real_t[nr * (np1_cached + 1) * np2_cached];
+        D_pxi_pface_cache = new real_t[nr * (np1_cached + 1) * np2_cached];
+        D_pxi_xface_cache = new real_t[nr * np1_cached * (np2_cached + 1)];
+        D_xixi_cache      = new real_t[nr * np1_cached * (np2_cached + 1)];
         
         nr_cached = nr;
     }
     
     // Calculate or load diffusion coefficients for each radial point (only if not cached)
     if (!operator_cached) {
-        if (use_precomputed_matrix && matrix_loader) {
-        // Use pre-computed matrix with amplitude scaling
+        // Use REVERSE resonance solving method for grid-independent results
         for (len_t ir = 0; ir < nr; ir++) {
-            auto *mg = grid->GetMomentumGrid(ir);
-            const len_t np1 = mg->GetNp1();
-            const len_t np2 = mg->GetNp2();
-            
-            // Zero out caches
-            memset(D_pp_cache + ir * (np1 + 1) * np2, 0, sizeof(real_t) * (np1 + 1) * np2);
-            memset(D_pxi_cache + ir * np1 * (np2 + 1), 0, sizeof(real_t) * np1 * (np2 + 1));
-            memset(D_xixi_cache + ir * np1 * (np2 + 1), 0, sizeof(real_t) * np1 * (np2 + 1));
-            
-            // Fill from pre-computed matrix (already scaled by amplitude)
-            for (len_t j = 0; j < np2; j++) {
-                for (len_t i = 0; i < np1 + 1; i++) {
-                    if (i < np1) {  // Only access valid indices
-                        D_pp_cache[ir * (np1 + 1) * np2 + i * np2 + j] = 
-                            matrix_loader->getDppScaled(i, j);
-                    }
-                }
-            }
-            
-            for (len_t j = 0; j < np2 + 1; j++) {
-                for (len_t i = 0; i < np1; i++) {
-                    D_pxi_cache[ir * np1 * (np2 + 1) + i * (np2 + 1) + j] = 
-                        matrix_loader->getDpxiScaled(i, j);
-                    D_xixi_cache[ir * np1 * (np2 + 1) + i * (np2 + 1) + j] = 
-                        matrix_loader->getDxixiScaled(i, j);
-                }
-            }
+            calculateDiffusionCoefficientsReverse(ir);
         }
         
-        std::cerr << "✓ Quasi-linear diffusion operator loaded from pre-computed matrix" << std::endl;
-        
-        // ====================================================================
-        // NaN Check: Validate all loaded diffusion coefficients
-        // ====================================================================
-        bool has_nan = false;
-        len_t nan_count_pp = 0, nan_count_pxi = 0, nan_count_xixi = 0;
-        
-        for (len_t ir = 0; ir < nr; ir++) {
-            auto *mg = grid->GetMomentumGrid(ir);
-            const len_t np1 = mg->GetNp1();
-            const len_t np2 = mg->GetNp2();
-            
-            // Check D_pp
-            for (len_t j = 0; j < np2; j++) {
-                for (len_t i = 0; i < np1 + 1; i++) {
-                    real_t val = D_pp_cache[ir * (np1 + 1) * np2 + i * np2 + j];
-                    if (std::isnan(val) || std::isinf(val)) {
-                        has_nan = true;
-                        nan_count_pp++;
-                        if (nan_count_pp <= 5) {
-                            std::cerr << "ERROR: NaN/Inf in D_pp at ir=" << ir 
-                                     << ", i=" << i << ", j=" << j 
-                                     << ", value=" << val << std::endl;
-                        }
-                    }
-                }
-            }
-            
-            // Check D_pξ and D_ξξ
-            for (len_t j = 0; j < np2 + 1; j++) {
-                for (len_t i = 0; i < np1; i++) {
-                    real_t val_pxi = D_pxi_cache[ir * np1 * (np2 + 1) + i * (np2 + 1) + j];
-                    real_t val_xixi = D_xixi_cache[ir * np1 * (np2 + 1) + i * (np2 + 1) + j];
-                    
-                    if (std::isnan(val_pxi) || std::isinf(val_pxi)) {
-                        has_nan = true;
-                        nan_count_pxi++;
-                        if (nan_count_pxi <= 5) {
-                            std::cerr << "ERROR: NaN/Inf in D_pξ at ir=" << ir 
-                                     << ", i=" << i << ", j=" << j 
-                                     << ", value=" << val_pxi << std::endl;
-                        }
-                    }
-                    
-                    if (std::isnan(val_xixi) || std::isinf(val_xixi)) {
-                        has_nan = true;
-                        nan_count_xixi++;
-                        if (nan_count_xixi <= 5) {
-                            std::cerr << "ERROR: NaN/Inf in D_ξξ at ir=" << ir 
-                                     << ", i=" << i << ", j=" << j 
-                                     << ", value=" << val_xixi << std::endl;
-                        }
-                    }
-                }
-            }
-        }
-        
-        if (has_nan) {
-            std::cerr << "\n========================================" << std::endl;
-            std::cerr << "FATAL ERROR: Quasi-linear diffusion coefficients contain NaN/Inf!" << std::endl;
-            std::cerr << "  D_pp NaN/Inf count:   " << nan_count_pp << std::endl;
-            std::cerr << "  D_pξ NaN/Inf count:   " << nan_count_pxi << std::endl;
-            std::cerr << "  D_ξξ NaN/Inf count:   " << nan_count_xixi << std::endl;
-            std::cerr << "\nPossible causes:" << std::endl;
-            std::cerr << "  1. Pre-computed HDF5 file contains invalid data" << std::endl;
-            std::cerr << "  2. Wave amplitude scaling produced overflow" << std::endl;
-            std::cerr << "  3. Grid mismatch between HDF5 and DREAM" << std::endl;
-            std::cerr << "  4. Numerical issues in Python precomputation" << std::endl;
-            std::cerr << "\nAborting simulation to prevent numerical instability." << std::endl;
-            std::cerr << "========================================\n" << std::endl;
-            throw DREAM::DREAMException("Quasi-linear diffusion coefficients contain NaN/Inf values");
-        }
-        
-        std::cerr << "✓ All diffusion coefficients validated (no NaN/Inf detected)" << std::endl;
-        } else {
-            // Use REVERSE resonance solving method for grid-independent results
-            for (len_t ir = 0; ir < nr; ir++) {
-                calculateDiffusionCoefficientsReverse(ir);
-            }
-            
-            std::cerr << "✓ Quasi-linear diffusion operator computed on-the-fly (REVERSE method)" << std::endl;
-        }
+        std::cerr << "✓ Quasi-linear diffusion operator computed on-the-fly (REVERSE method)" << std::endl;
     }
     
     // Mark operator as cached - no need to recalculate in future time steps
@@ -486,21 +294,29 @@ void QuasilinearDiffusionTerm::Rebuild(const real_t t, const real_t /*dt*/, FVM:
             }
         }
         
-        // D12 = D21 = D_pξ (cross diffusion from quasi-linear theory)
-        // Fill from pre-computed cache (Zehua Guo Eq. 11b)
+        // D12 = D_pξ at p-face (same grid as D11: (np1+1) × np2)
+        for (len_t j = 0; j < np2; j++) {
+            for (len_t i = 0; i < np1 + 1; i++) {
+                real_t val = D_pxi_pface_cache[ir * (np1 + 1) * np2 + i * np2 + j];
+                if (std::isnan(val) || std::isinf(val)) {
+                    std::cerr << "FATAL: NaN/Inf in D12 (p-face) at ir=" << ir
+                             << ", i=" << i << ", j=" << j << std::endl;
+                    throw DREAM::DREAMException("NaN/Inf in D_pxi p-face during FVM assembly");
+                }
+                D12(ir, i, j) += val;
+            }
+        }
+        
+        // D21 = D_pξ at ξ-face (same grid as D22: np1 × (np2+1))
         for (len_t j = 0; j < np2 + 1; j++) {
             for (len_t i = 0; i < np1; i++) {
-                real_t D_pxi_val = getD_pxi(ir, i, j);
-                
-                // Final safety check for cross terms
-                if (std::isnan(D_pxi_val) || std::isinf(D_pxi_val)) {
-                    std::cerr << "FATAL: Attempting to fill NaN/Inf into D12/D21 at ir=" << ir 
+                real_t val = D_pxi_xface_cache[ir * np1 * (np2 + 1) + i * (np2 + 1) + j];
+                if (std::isnan(val) || std::isinf(val)) {
+                    std::cerr << "FATAL: NaN/Inf in D21 (ξ-face) at ir=" << ir
                              << ", i=" << i << ", j=" << j << std::endl;
-                    throw DREAM::DREAMException("NaN/Inf detected in D_pxi during FVM matrix assembly");
+                    throw DREAM::DREAMException("NaN/Inf in D_pxi ξ-face during FVM assembly");
                 }
-                
-                D12(ir, i, j) += D_pxi_val;
-                D21(ir, i, j) += D_pxi_val;  // Symmetric tensor
+                D21(ir, i, j) += val;
             }
         }
         
@@ -626,11 +442,13 @@ void QuasilinearDiffusionTerm::calculateDiffusionCoefficientsReverse(len_t ir) {
               << " (" << numModes << " modes × " << numHarmonics << " harmonics)..." << std::endl;
     
     // Initialize caches to zero
-    for (len_t i = 0; i < (np1 + 1) * np2; i++)
+    for (len_t i = 0; i < (np1 + 1) * np2; i++) {
         D_pp_cache[ir * (np1 + 1) * np2 + i] = 0.0;
+        D_pxi_pface_cache[ir * (np1 + 1) * np2 + i] = 0.0;
+    }
     
     for (len_t i = 0; i < np1 * (np2 + 1); i++) {
-        D_pxi_cache[ir * np1 * (np2 + 1) + i] = 0.0;
+        D_pxi_xface_cache[ir * np1 * (np2 + 1) + i] = 0.0;
         D_xixi_cache[ir * np1 * (np2 + 1) + i] = 0.0;
     }
     
@@ -766,66 +584,54 @@ void QuasilinearDiffusionTerm::calculateDiffusionCoefficientsReverse(len_t ir) {
                     weight_low /= weight_sum;
                     weight_high /= weight_sum;
                     
-                    // Calculate coupling strength at resonant point
-                    real_t psi_squared = coupling->calculateCouplingStrength(
-                        p_res, xi, k, theta_k, n, *dispersion
+                    // Calculate bracket term and dielectric derivative den
+                    real_t bracket = 0.0, den = 1.0;
+                    coupling->calculateBracketAndDen(
+                        p_res, xi, k, theta_k, n, *dispersion,
+                        bracket, den
                     );
                     
-                    // Scale by wave amplitude
-                    psi_squared *= amplitude * amplitude;
+                    // Wave electric field energy: |E_k|² = amplitude × m_e c² / (ε₀ × den)
+                    static constexpr real_t m_e = 9.1094e-31;
+                    static constexpr real_t c = 2.99792458e8;
+                    static constexpr real_t eps0 = 8.854187817e-12;
+                    real_t E_k_sq = amplitude * m_e * c * c / (eps0 * den);
                     
-                    // Quadrature weight for ∫ dk d(cos θ_k) — grid-independent normalization
-                    psi_squared *= cell_area;
+                    // Full contribution: bracket × |E_k|² × k² × Δcosθ × weight
+                    real_t contrib = bracket * E_k_sq * k * k * cell_area * weight_sum;
                     
-                    // Apply resonance weight
-                    psi_squared *= weight_sum;  // Total weight for normalization
-                    
-                    // Calculate geometric factors at resonant point
+                    // Geometric factor at resonant point
                     real_t gamma = std::sqrt(1.0 + p_res * p_res);
-                    real_t v_par_over_c = (p_res / gamma) * xi;
-                    real_t c_val = 2.99792458e8;  // Speed of light (m/s)
-                    real_t xi_minus_kpar_v_over_omega = xi - k_parallel * v_par_over_c * c_val / omega;
+                    real_t v_over_c = p_res / gamma;
+                    real_t kpar_v_over_omega = k_parallel * v_over_c * c / omega;
+                    real_t geom = -xi + kpar_v_over_omega;
+                    real_t sqrt_1mxi2 = std::sqrt(1.0 - xi * xi);
+                    real_t contrib_pxi   = sqrt_1mxi2 * geom * contrib;
+                    real_t contrib_xixi  = geom * geom * contrib;
                     
-                    // Accumulate to D_pp (at f1 grid points)
-                    // Distribute to i_low and i_high with weights
-                    // D_pp ∝ (1 - ξ²) per Zehua Guo (2024) Eq. 11
-                    len_t idx_pp_low = ir * (np1 + 1) * np2 + i_low * np2 + j;
+                    // ---- D_pp: p-face (i_f, j), f1 grid ----
+                    len_t idx_pp_low  = ir * (np1 + 1) * np2 + i_low  * np2 + j;
                     len_t idx_pp_high = ir * (np1 + 1) * np2 + i_high * np2 + j;
+                    D_pp_cache[idx_pp_low]  += (1.0 - xi * xi) * contrib * weight_low;
+                    D_pp_cache[idx_pp_high] += (1.0 - xi * xi) * contrib * weight_high;
                     
-                    D_pp_cache[idx_pp_low] += psi_squared * (1.0 - xi * xi) * weight_low;
-                    D_pp_cache[idx_pp_high] += psi_squared * (1.0 - xi * xi) * weight_high;
+                    // ---- D_pξ: p-face (i_f, j), same face grid as D_pp ----
+                    // Stencil reads D12 at interior p-faces (i_f < np1, 0 < j < np2-1)
+                    len_t idx_pxi_p_low  = ir * (np1 + 1) * np2 + i_low  * np2 + j;
+                    len_t idx_pxi_p_high = ir * (np1 + 1) * np2 + i_high * np2 + j;
+                    D_pxi_pface_cache[idx_pxi_p_low]  += contrib_pxi * weight_low;
+                    D_pxi_pface_cache[idx_pxi_p_high] += contrib_pxi * weight_high;
                     
-                    // Accumulate to D_pξ and D_ξξ (at f2 grid points)
-                    // For f2 grid, p index ranges from 0 to np1-1
-                    // Need to clamp i_low and i_high to valid range
-                    len_t i_low_f2 = std::min(i_low, np1 - 1);
-                    len_t i_high_f2 = std::min(i_high, np1 - 1);
-                    
-                    // BOUNDS CHECK: Ensure indices are valid
-                    if (i_low_f2 >= np1 || j >= (np2 + 1)) {
-                        std::cerr << "ERROR: Invalid index for D_pxi/D_xixi: i_low_f2=" << i_low_f2 
-                                  << ", j=" << j << ", np1=" << np1 << ", np2=" << np2 << std::endl;
-                        throw DREAMException("Array index out of bounds in calculateDiffusionCoefficientsReverse");
-                    }
-                    if (i_high_f2 >= np1 || j >= (np2 + 1)) {
-                        std::cerr << "ERROR: Invalid index for D_pxi/D_xixi: i_high_f2=" << i_high_f2 
-                                  << ", j=" << j << ", np1=" << np1 << ", np2=" << np2 << std::endl;
-                        throw DREAMException("Array index out of bounds in calculateDiffusionCoefficientsReverse");
-                    }
-                    
-                    len_t idx_pxi_low = ir * np1 * (np2 + 1) + i_low_f2 * (np2 + 1) + j;
-                    len_t idx_pxi_high = ir * np1 * (np2 + 1) + i_high_f2 * (np2 + 1) + j;
-                    len_t idx_xixi_low = ir * np1 * (np2 + 1) + i_low_f2 * (np2 + 1) + j;
-                    len_t idx_xixi_high = ir * np1 * (np2 + 1) + i_high_f2 * (np2 + 1) + j;
-                    
-                    real_t contrib_pxi = -psi_squared * std::sqrt(1.0 - xi * xi) * xi_minus_kpar_v_over_omega;
-                    real_t contrib_xixi = psi_squared * xi_minus_kpar_v_over_omega * xi_minus_kpar_v_over_omega;
-                    
-                    D_pxi_cache[idx_pxi_low] += contrib_pxi * weight_low;
-                    D_pxi_cache[idx_pxi_high] += contrib_pxi * weight_high;
-                    
-                    D_xixi_cache[idx_xixi_low] += contrib_xixi * weight_low;
-                    D_xixi_cache[idx_xixi_high] += contrib_xixi * weight_high;
+                    // ---- D_ξξ and D_pξ: ξ-face (i_cell, j_f), f2 grid ----
+                    // Resonance at cell center j sits between ξ-faces j and j+1.
+                    // p_res is between p-faces i_low and i_high → cell center index = i_low
+                    len_t i_cell = i_low;
+                    len_t idx_xface_j   = ir * np1 * (np2 + 1) + i_cell * (np2 + 1) + j;
+                    len_t idx_xface_jp1 = ir * np1 * (np2 + 1) + i_cell * (np2 + 1) + (j + 1);
+                    D_xixi_cache[idx_xface_j]       += 0.5 * contrib_xixi;
+                    D_xixi_cache[idx_xface_jp1]     += 0.5 * contrib_xixi;
+                    D_pxi_xface_cache[idx_xface_j]  += 0.5 * contrib_pxi;
+                    D_pxi_xface_cache[idx_xface_jp1] += 0.5 * contrib_pxi;
                 }
             }
         }
